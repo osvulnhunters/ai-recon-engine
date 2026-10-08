@@ -9,8 +9,8 @@ import argparse
 import functools
 import json
 import re
+import ipaddress
 import shutil
-import sqlite3
 import subprocess
 import sys
 import threading
@@ -19,6 +19,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlparse
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from core.database import Database  # noqa: E402
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -194,6 +197,41 @@ def phase_dns(ctx):
     return status_from([rc])
 
 
+def _ip_or_none(value):
+    try:
+        return str(ipaddress.ip_address(value))
+    except (ValueError, TypeError):
+        return None
+
+
+def parse_httpx_json(path):
+    """Return (host dicts for the DB, list of live URLs) from httpx -json output."""
+    hosts, urls = [], []
+    if not has_data(path):
+        return hosts, urls
+    for line in Path(path).read_text().splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            d = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        url = d.get("url") or ""
+        if not URL_RE.match(url):
+            continue
+        tech = d.get("tech") or d.get("technologies") or []
+        ip = _ip_or_none(d.get("host_ip")) or _ip_or_none(d.get("host")) \
+            or next((x for x in (_ip_or_none(a) for a in (d.get("a") or [])) if x), None)
+        hosts.append({
+            "hostname": urlparse(url).hostname, "ip": ip,
+            "status_code": d.get("status_code"), "title": d.get("title"),
+            "tech": ", ".join(tech) if isinstance(tech, list) else str(tech),
+        })
+        urls.append(url)
+    return hosts, urls
+
+
 def phase_live(ctx):
     httpx = find_pd_httpx()
     if not httpx:
@@ -202,8 +240,15 @@ def phase_live(ctx):
     if not has_data(ctx.subs):
         warn("No subdomains.")
         return "skipped"
-    rc = ctx.run([httpx, "-silent", "-no-color"], out_file=ctx.live, stdin_file=ctx.subs)
-    dedupe_file(ctx.live)
+    raw = ctx.dir("03_live_hosts") / "live.jsonl"
+    rc = ctx.run([httpx, "-silent", "-no-color", "-json", "-sc", "-title", "-td", "-ip"],
+                 out_file=raw, stdin_file=ctx.subs)
+    hosts, urls = parse_httpx_json(raw)
+    urls = sorted(set(urls))
+    ctx.live.write_text("\n".join(urls) + ("\n" if urls else ""))
+    if hosts:
+        ctx.db.add_hosts_bulk(ctx.scan_id, hosts)
+    ok(f"{len(urls)} live hosts ({len(hosts)} rows saved to DB).")
     return status_from([rc])
 
 
@@ -258,11 +303,16 @@ def _ffuf_over_hosts(ctx, wordlist_name, out_dir, tag):
     if not hosts:
         warn("No live hosts.")
         return "skipped"
+    # URL is {host}/FUZZ, so entries must not start with "/" (else "//api")
+    entries = [l.strip().lstrip("/") for l in wl.read_text().splitlines()
+               if l.strip() and not l.lstrip().startswith("#")]
+    clean_wl = ctx.dir("_metadata") / f"wl_{wordlist_name}"
+    clean_wl.write_text("\n".join(dict.fromkeys(entries)) + "\n")
     codes = []
     for host in hosts:
         name = safe_name(host)
         codes.append(ctx.run(
-            ["ffuf", "-u", f"{host.rstrip('/')}/FUZZ", "-w", str(wl),
+            ["ffuf", "-u", f"{host.rstrip('/')}/FUZZ", "-w", str(clean_wl),
              "-rate", str(ctx.args.rate), "-mc", "200,204,301,302,307,401,403",
              "-s", "-of", "json", "-o", str(out_dir / f"{tag}_{name}.json")],
             out_file=out_dir / f"{tag}_{name}.txt"))
@@ -325,8 +375,9 @@ def phase_intel(ctx):
 
 
 def phase_ssl(ctx):
-    if not (shutil.which("testssl.sh") and has_data(ctx.live)):
-        warn("testssl.sh missing or no live hosts.")
+    testssl = shutil.which("testssl.sh") or shutil.which("testssl")
+    if not (testssl and has_data(ctx.live)):
+        warn("testssl.sh/testssl missing or no live hosts.")
         return "skipped"
     hosts = [h for h in read_hosts(ctx.live, ctx.args.max_hosts) if h.startswith("https://")]
     if not hosts:
@@ -340,7 +391,7 @@ def phase_ssl(ctx):
             f.write(f"\n\n===== SSL Analysis for: {target} =====\n")
             info(f"testssl.sh {target}")
             try:
-                r = subprocess.run(["testssl.sh", "--quiet", target],
+                r = subprocess.run([testssl, "--quiet", target],
                                    capture_output=True, text=True, timeout=120)
                 f.write(r.stdout + r.stderr)
             except subprocess.TimeoutExpired:
@@ -372,16 +423,6 @@ PHASES = [
     ("15_takeover", phase_takeover),
 ]
 EXTRA_FOLDERS = ["_findings", "_reports", "_metadata"]
-
-
-# --- Database ---
-def setup_db():
-    conn = sqlite3.connect(BASE_DIR / "bug_bounty.db")  # always next to recon.py
-    conn.execute("""CREATE TABLE IF NOT EXISTS scans
-                    (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                     target TEXT, scan_date TEXT, status TEXT)""")
-    conn.commit()
-    return conn
 
 
 # --- AI handover file ---
@@ -455,12 +496,9 @@ def main():
     info(f"Rate limit: {args.rate} req/s | Max hosts per phase: {args.max_hosts or 'all'}")
     warn("Run this only against targets you are authorized to test.")
 
-    conn = setup_db()
-    cur = conn.cursor()
-    cur.execute("INSERT INTO scans (target, scan_date, status) VALUES (?, ?, ?)",
-                (target, datetime.now(timezone.utc).isoformat(), "running"))
-    conn.commit()
-    scan_id = cur.lastrowid
+    db = Database()
+    scan_id = db.start_scan(target)
+    ctx.db, ctx.scan_id = db, scan_id
     ok(f"Database scan ID: {scan_id}")
 
     statuses = {}
@@ -489,9 +527,9 @@ def main():
         final_status = "failed"
         fail(f"Fatal error: {e}")
     finally:
-        cur.execute("UPDATE scans SET status = ? WHERE id = ?", (final_status, scan_id))
-        conn.commit()
-        conn.close()
+        db.finish_scan(scan_id, final_status,
+                       ", ".join(f"{k}={v}" for k, v in statuses.items()))
+        db.close()
         write_ai_readme(ctx, statuses)
 
     head(f"Recon Engine finished ({final_status}) in {fmt_secs(time.monotonic() - scan_started)}")
@@ -499,6 +537,7 @@ def main():
         print(f"    {name:<18} {st:<12} {fmt_secs(durations.get(name, 0))}")
     ok(f"Raw data: {results}")
     ok(f"AI handover file: {results / '00_README_FOR_AI.md'}")
+    ok(f"Report: bash scripts/generate_report.sh --scan-id {scan_id}")
 
 
 if __name__ == "__main__":
