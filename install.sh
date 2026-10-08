@@ -29,13 +29,22 @@ head "1. System Packages"
 sudo apt update -y >> "$LOG" 2>&1
 
 for pkg in git curl wget jq build-essential python3 python3-pip pipx \
-           golang-go unzip dnsutils whois; do
+           golang-go unzip dnsutils whois python3-venv; do
   if dpkg -l "$pkg" 2>/dev/null | grep -q "^ii"; then
     ok "$pkg (already installed)"
   else
     sudo apt install -y "$pkg" >> "$LOG" 2>&1 && ok "$pkg" || fail "$pkg"
   fi
 done
+
+# Warn early if Go is too old for current ProjectDiscovery tools
+GO_MIN="1.22"
+gov="$(go version 2>/dev/null | awk '{print $3}' | sed 's/^go//')"
+if [ -z "$gov" ]; then
+  fail "Go not found - Go-based tools will fail to install"
+elif [ "$(printf '%s\n' "$GO_MIN" "$gov" | sort -V | head -1)" != "$GO_MIN" ]; then
+  warn "Go $gov is old (need >= $GO_MIN). If 'go install' fails below, install the latest Go from https://go.dev/dl/"
+fi
 
 # Ensure Go PATH
 export PATH="$PATH:/usr/local/go/bin:$HOME/go/bin:$HOME/.local/bin"
@@ -88,8 +97,10 @@ done
 # ─────────────────────────────
 head "4. Python Dependencies"
 # ─────────────────────────────
-pip3 install -r requirements.txt --break-system-packages >> "$LOG" 2>&1 \
-  && ok "Python requirements" || fail "Some packages failed"
+# NOTE: recon.py itself only needs the standard library; these are for optional/future intel phases.
+python3 -m venv .venv >> "$LOG" 2>&1 \
+  && .venv/bin/pip install -r requirements.txt >> "$LOG" 2>&1 \
+  && ok "Python requirements (in .venv)" || fail "Python requirements failed (see $LOG)"
 
 # ─────────────────────────────
 head "5. Nuclei Templates"
@@ -117,6 +128,21 @@ if ! has subzy; then
     && ok "subzy" || warn "subzy failed (optional)"
 else
   ok "subzy (already installed)"
+fi
+
+# testssl for SSL analysis (phase 13)
+if has testssl.sh || has testssl; then
+  ok "testssl (already installed)"
+else
+  info "Installing testssl..."
+  if sudo apt install -y testssl.sh >> "$LOG" 2>&1; then
+    ok "testssl (apt)"
+  else
+    mkdir -p "$HOME/.local/bin" "$HOME/.local/share"
+    git clone --depth 1 https://github.com/drwetter/testssl.sh.git "$HOME/.local/share/testssl.sh" >> "$LOG" 2>&1 \
+      && ln -sf "$HOME/.local/share/testssl.sh/testssl.sh" "$HOME/.local/bin/testssl.sh" \
+      && ok "testssl (git clone)" || warn "testssl failed (optional)"
+  fi
 fi
 
 # ─────────────────────────────
