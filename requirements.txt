@@ -1,0 +1,24 @@
+# AI Recon Engine - Python Dependencies
+# All lightweight, no heavy ML libraries
+
+# HTTP requests
+requests>=2.31.0
+urllib3>=2.0.0
+
+# DNS resolution
+dnspython>=2.4.0
+
+# Data handling
+pyyaml>=6.0.0
+
+# API clients (optional)
+shodan>=1.31.0
+censys>=2.2.0
+vt-py>=0.18.0
+#securitytrails>=0.1.0
+
+# Terminal colors
+colorama>=0.4.6
+
+# Progress bars
+tqdm>=4.66.0

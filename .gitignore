@@ -1,0 +1,13 @@
+# API Keys and Secrets
+config.json
+.env
+
+# Logs and Results
+logs/
+results/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
